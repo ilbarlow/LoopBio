@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Feb 16 14:53:26 2018
+
+@author: ibarlow
+"""
+
+"""Script for analysing output from new loopbio rig - did a test to see if the
+blue light panel works, which was switched on for 5 minutes and then switched off
+after 5 minutes of blue light exposure.
+The light data is supplied in a .json file"""
+
+import TierPsyInput as TP
+import os
+import tables
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import json
+
+
+directoryA, fileDirA, featuresA = TP.TierPsyInput('new', 'none')
+reps = list(fileDirA.keys())
+
+#actually want to load the skeletons data to get information about the individual worms 
+    #rather than plate averages
+
+skeletons = {}
+featuresW = {}
+timeseries = {} 
+fps = {}
+for rep in fileDirA:
+    with tables.File(os.path.join(directoryA, rep, 'metadata_skeletons.hdf5'), 'r') as fid:
+        skeletons[rep] = fid.get_node('/skeleton')[:]
+
+    with pd.HDFStore(os.path.join(directoryA, rep, 'metadata_skeletons.hdf5'), 'r') as fid:
+        featuresW[rep] = fid['/trajectories_data']
+        
+
+    with pd.HDFStore(os.path.join(directoryA, rep, 'metadata_featuresN.hdf5'), 'r') as fid:    
+        timeseries[rep] = fid['/timeseries_data']
+        fps [rep] = fid.get_node('/trajectories_data')._v_attrs['fps']
+
+#list all the worm indices
+     #now need to filter out those that are real worms
+min_track = 500 #set min track length (1minute)
+max_track = 22000 #15 mins
+worms = {}
+featuresW2={}
+worms_final ={}
+for rep in featuresW:
+    worms [rep] = list(np.unique(featuresW[rep]['worm_index_joined']))
+
+    #filter those with good skeletons
+    featuresW2[rep]=featuresW[rep][featuresW[rep]['is_good_skel']]
+    worms_final[rep] = {} #empty dictionary
+    #filter each worm
+    for worm in worms[rep]:
+        length = featuresW2[rep][featuresW2[rep]['worm_index_joined'] == worm].shape[0]
+        if min_track<=length<=max_track:
+            worms_final[rep][worm] = featuresW2[rep][featuresW2[rep]['worm_index_joined'] == worm]
+
+#alternative skeleton plot
+sns.set_style('whitegrid')
+for rep in worms_final:
+    plt.figure()
+    for worm in worms_final[rep]:
+        plt.plot(worms_final[rep][worm]['coord_x'], worms_final[rep][worm]['coord_y'])
+    plt.axis('equal')
+    plt.xlabel ('x')
+    plt.ylabel('y')
+    plt.savefig(os.path.join(directoryA[:-7], 'Figures', rep + 'tracks.png'), dpi = 150)
+
+#these should be real worms
+        #so can now plot their skeletons and trajectories
+skeletonsW={}
+for rep in skeletons:
+    skeletonsW[rep] = {}
+    sns.set_palette(sns.color_palette("tab20", len(worms[rep])))
+    plt.figure()
+    for worm in worms_final[rep]:
+        skeletonsW[rep][worm] = skeletons[rep][worms_final[rep][worm].index]
+    
+        plt.plot(skeletonsW[rep][worm][:,:,0], skeletonsW[rep][worm][:,:,1])
+    plt.axis ('equal')
+    plt.show()
+
+del worm, skeletons, featuresW
+
+#%%
+import matplotlib.patches as patch
+
+#now i need to figure out when the blue light was switched on and off
+
+#create new directory for finding the json files
+directoryB = directoryA[:-8]
+fileConts ={}
+conds = {}
+light ={}
+temp ={}
+frame_no = {}
+for rep in fileDirA:
+    fileConts[rep] = os.listdir(os.path.join(directoryB, rep))
+    fileConts[rep] = np.sort(fileConts[rep]) #sort to make sure in correct order
+    #create a dictionary of the conditions
+    conds[rep]={}
+    for line in fileConts[rep]:
+        if line.endswith('extra.json'):
+            with open(os.path.join(directoryB,rep, line), 'r') as f:
+                conds[rep][str(line[0:7])] = json.load(f)
+
+    #need to unpack this to be able to plot light as a function of time
+    light[rep] = []
+    temp[rep] = []
+    frame_no[rep] = []
+    for cond in conds[rep]:
+        for frame in conds[rep][cond]:
+            light[rep].append(frame['light'])
+            temp[rep].append(frame['temp'])
+            frame_no[rep].append(frame['frame_number'])
+
+#now align to frames in timeseries
+frames2 = {}
+on= {}
+off = {}
+for rep in light:
+    frames2[rep] = []
+    frames2 [rep][:] = [x-frame_no[rep][0] for x in frame_no[rep]] #vectorise and subtract frame number from first frame
+
+    #lights on and off as first and last big changes
+    light_diff = np.argwhere(np.abs(np.diff(light[rep]))>10)
+    on[rep] = frames2[rep][light_diff[0][0]] #find where blue light goes on
+    off[rep] = frames2[rep][light_diff[-1][0]] #and off
+
+#need to manually change rep1 - as i switched light off before ending experiment
+rep = reps[2]
+light_diff = np.argwhere(np.diff(light[rep]))
+off[rep] = frames2[rep][light_diff[-3][0]]
+
+#now plot the lights on and off
+for rep in light:
+    plt.figure()
+    plt.plot(frames2[rep], light[rep])
+    plt.stem ([on[rep], off[rep]], [np.max(light[rep])+10, np.max(light[rep])+10], 'k')
+    plt.ylabel('light intensity')
+    plt.xlabel ('frame number')
+    plt.show()
+
+#so now know when lights came on and off so can plot trajectories after lights on and off
+    #use relative_speed_midbody to figure out if worms move backwards or accelerate after blue lights switch on
+timeseriesW = {}
+for rep in timeseries:
+    timeseriesW[rep] = {}
+    for worm in worms_final[rep]:
+        timeseriesW[rep][worm] = timeseries[rep][timeseries[rep]['worm_index']==worm]
+
+#find the worms that have trajectories between on and off
+blue = {}
+red = {}
+for rep in timeseriesW:
+    blue[rep] = {} #blue light ON
+    red [rep]= {} #blue light OFF
+    for worm in timeseriesW[rep]:
+        if np.sum(timeseriesW[rep][worm]['timestamp'] == on[rep])>0:
+            blue[rep][worm] = timeseriesW[rep][worm]
+        if np.sum(timeseriesW[rep][worm]['timestamp'] == off[rep])>0:
+            red[rep][worm] = timeseriesW[rep][worm]
+
+# make a final dictionary with blue light on worms
+blue_final = {}
+for rep in blue:
+    blue_final[rep] ={}
+    for worm in blue[rep]:
+        blue_final[rep] [worm] = blue[rep][worm].loc[lambda df:df.timestamp > on[rep]-1500] #1500 frames (one minute) before blue light on
+
+#make figure with blue box for blue light
+for rep in blue_final:
+    fig = plt.figure()
+    ax1 = fig.add_subplot(111)
+    ax1.add_patch(patch.Rectangle((on[rep], -250), 2000, 600, fc = 'b', alpha = 0.1))
+    for worm in blue_final[rep]:
+        ax1 = plt.plot(blue_final[rep][worm]['timestamp'].iloc[:2000], blue_final[rep][worm]['speed'].iloc[:2000])
+        #plt.stem ([on], [300], 'k')    
+    plt.xlabel('frame')
+    plt.ylabel ('speed')
+    plt.show()
+
+#and the same for when the lights go off
+blue_off = {}
+for rep in red:
+    blue_off[rep] = {}
+    for worm in red[rep]:
+        blue_off[rep][worm] = red[rep][worm].loc[lambda df:df.timestamp>off[rep] - 1000]
+
+#make figure with red box for when blue light off
+for rep in blue_off:
+    fig = plt.figure()
+    ax1 = fig.add_subplot(111)
+    ax1.add_patch(patch.Rectangle((off[rep]-1000, -250), 1000, 600, fc='b', alpha = 0.2))
+    ax1.add_patch(patch.Rectangle((off[rep], -250), 2000, 600, fc='r', alpha = 0.2))
+    for worm in blue_off[rep]:
+        ax1 = plt.plot(blue_off[rep][worm]['timestamp'].iloc[:2000], blue_off[rep][worm]['speed'].iloc[:2000])
+    plt.xlabel('frame')
+    plt.ylabel('speed')
+    plt.show()    
+
+
+#just plot all of the timeseries
+    #bin in 5 * fps bins
+
+#create bin
+delT = 5*fps[rep]
+
+#create dictionaries to plot the data
+timeseries_bins = {}
+on_bin = {}
+off_bin = {}
+for rep in timeseries:
+    timeseries[rep]['tt_bin'] = np.ceil(timeseries[rep]['timestamp']/delT) #assign bin
+    timeseries_bins[rep] = timeseries[rep].abs().groupby('tt_bin').agg(np.median) #group only numberic (abs) values by tt_bin and take the median
+    on_bin[rep] = np.ceil(on[rep]/delT) #determine on and off bin
+    off_bin[rep] = np.ceil(off[rep]/delT)
+    
+    #make a figure
+    fig = plt.figure()
+    ax1 = fig.add_subplot(111)
+    ax1.add_patch(patch.Rectangle((on_bin[rep], -20), (off_bin[rep]-on_bin[rep]),\
+                                  50, fc= 'b', alpha = 0.2))
+    ax1= plt.plot(timeseries_bins[rep]['speed'])
+    plt.xlabel ('frame')
+    plt.ylabel ('speed')
+    plt.savefig(os.path.join(directoryA[:-7], 'Figures', rep + '_speed.png'), dpi = 150)
+    plt.show()
+ 
